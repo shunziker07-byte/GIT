@@ -17,13 +17,15 @@ var (
 // mcpAppsFeatureFlag is the feature flag name that controls MCP Apps UI metadata.
 // This is defined here to avoid importing pkg/github (which imports pkg/inventory).
 // The value must match github.MCPAppsFeatureFlag.
-const mcpAppsFeatureFlag = "remote_mcp_ui_apps"
+const mcpAppsFeatureFlag FeatureFlag = "remote_mcp_ui_apps"
 
 // ToolFilter is a function that determines if a tool should be included.
 // Returns true if the tool should be included, false to exclude it.
 type ToolFilter func(ctx context.Context, tool *ServerTool) (bool, error)
 
-// Builder builds a Registry with the specified configuration.
+// Builder builds a Registry with the specified configuration. SetTools,
+// SetResources, and SetPrompts copy the feature and metadata state retained by
+// the inventory.
 // Use NewBuilder to create a builder, chain configuration methods,
 // then call Build() to create the final inventory.
 //
@@ -65,20 +67,47 @@ func NewBuilder() *Builder {
 
 // SetTools sets the tools for the inventory. Returns self for chaining.
 func (b *Builder) SetTools(tools []ServerTool) *Builder {
-	b.tools = tools
+	b.tools = slices.Clone(tools)
+	for i := range b.tools {
+		b.tools[i] = cloneServerTool(b.tools[i])
+	}
 	return b
 }
 
 // SetResources sets the resource templates for the inventory. Returns self for chaining.
 func (b *Builder) SetResources(resources []ServerResourceTemplate) *Builder {
-	b.resourceTemplates = resources
+	b.resourceTemplates = slices.Clone(resources)
+	for i := range b.resourceTemplates {
+		b.resourceTemplates[i] = cloneResourceTemplate(b.resourceTemplates[i])
+	}
 	return b
 }
 
 // SetPrompts sets the prompts for the inventory. Returns self for chaining.
 func (b *Builder) SetPrompts(prompts []ServerPrompt) *Builder {
-	b.prompts = prompts
+	b.prompts = slices.Clone(prompts)
+	for i := range b.prompts {
+		b.prompts[i] = clonePrompt(b.prompts[i])
+	}
 	return b
+}
+
+func cloneServerTool(tool ServerTool) ServerTool {
+	tool.Tool.Meta = maps.Clone(tool.Tool.Meta)
+	tool.FeatureRule = tool.FeatureRule.clone()
+	return tool
+}
+
+func cloneResourceTemplate(resource ServerResourceTemplate) ServerResourceTemplate {
+	resource.Template.Meta = maps.Clone(resource.Template.Meta)
+	resource.FeatureRule = resource.FeatureRule.clone()
+	return resource
+}
+
+func clonePrompt(prompt ServerPrompt) ServerPrompt {
+	prompt.Prompt.Meta = maps.Clone(prompt.Prompt.Meta)
+	prompt.FeatureRule = prompt.FeatureRule.clone()
+	return prompt
 }
 
 // WithDeprecatedAliases adds deprecated tool name aliases that map to canonical names.
@@ -125,15 +154,10 @@ func (b *Builder) WithTools(toolNames []string) *Builder {
 	return b
 }
 
-// WithFeatureChecker sets the feature flag checker function.
-// The checker receives a context (for actor extraction) and feature flag name,
-// and returns (enabled, error). Errors are logged and treated as "not enabled".
-//
-// When the checker is non-nil, Build() installs a feature-flag ToolFilter
-// at the head of the filter pipeline so that tools annotated with
-// FeatureFlagEnable / FeatureFlagDisable are gated accordingly. Resources
-// and prompts use the same checker via an explicit guard at their iteration
-// site.
+// WithFeatureChecker sets the feature flag checker function. Inventory items
+// declare their feature dependencies and functional availability rules through
+// FeatureRule. Checks are deduplicated into request-owned resolution state;
+// errors are logged and treated as disabled.
 //
 // When the checker is nil, no feature-flag filter is installed; tools,
 // resources, and prompts pass through feature-flag gating unchanged. The
@@ -212,15 +236,7 @@ func cleanTools(tools []string) []string {
 func (b *Builder) Build() (*Inventory, error) {
 	tools := b.tools
 
-	// Install the feature-flag filter at the head of the pipeline so that
-	// flag-gated tools are excluded before any user-supplied WithFilter sees
-	// them. Doing this in Build() (rather than inside WithFeatureChecker)
-	// keeps the install idempotent — repeated WithFeatureChecker calls
-	// replace the checker without stacking duplicate filters.
 	filters := b.filters
-	if b.featureChecker != nil {
-		filters = append([]ToolFilter{createFeatureFlagFilter(b.featureChecker)}, filters...)
-	}
 
 	r := &Inventory{
 		tools:             tools,
@@ -267,6 +283,8 @@ func (b *Builder) Build() (*Inventory, error) {
 			return nil, fmt.Errorf("%w: %s", ErrUnknownTools, strings.Join(unrecognizedTools, ", "))
 		}
 	}
+
+	r.cacheFeatureMetadata()
 
 	if b.generateInstructions {
 		r.instructions = generateInstructions(r)
